@@ -1,0 +1,58 @@
+name: Remote-Desktop-Setup
+
+on:
+  workflow_dispatch:
+
+jobs:
+  rdp-access:
+    runs-on: windows-latest
+    timeout-minutes: 3600
+
+    steps:
+      - name: 🔧 Enable Remote Desktop Service
+        run: |
+          # Activate RDP and disable NLA
+          Set-ItemProperty 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name "fDenyTSConnections" -Value 0
+          Set-ItemProperty 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "UserAuthentication" -Value 0
+          Set-ItemProperty 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "SecurityLayer" -Value 0
+          
+          # Allow incoming RDP connections via firewall
+          Get-NetFirewallRule -DisplayName "RDP-Allow" -ErrorAction SilentlyContinue | Remove-NetFirewallRule
+          New-NetFirewallRule -DisplayName "RDP-Allow" -Direction Inbound -Protocol TCP -LocalPort 3389 -Action Allow
+
+          Restart-Service -Name TermService -Force
+
+      - name: 👤 Create Temporary Admin User
+        run: |
+          # Generate random username and password
+          $UserName = "rdp_" + -join ((65..90) + (97..122) | Get-Random -Count 4 | % {[char]$_})
+          
+          $chars = ([char[]](33..126))
+          $Password = -join (1..16 | ForEach-Object { $chars | Get-Random })
+          $Secure = ConvertTo-SecureString $Password -AsPlainText -Force
+
+          New-LocalUser -Name $UserName -Password $Secure -AccountNeverExpires
+          Add-LocalGroupMember -Group "Administrators" -Member $UserName
+          Add-LocalGroupMember -Group "Remote Desktop Users" -Member $UserName
+
+          echo "USER_NAME=$UserName" >> $env:GITHUB_ENV
+          echo "USER_PASS=$Password" >> $env:GITHUB_ENV
+
+          if (-not (Get-LocalUser -Name $UserName)) {
+            Write-Error "User creation failed"
+            exit 1
+          }
+
+      - name: 🌐 Download & Install Tailscale
+        run: |
+          $url = "https://pkgs.tailscale.com/stable/tailscale-setup-latest-amd64.msi"
+          $path = "$env:TEMP\ts.msi"
+          Invoke-WebRequest $url -OutFile $path
+          Start-Process msiexec.exe -ArgumentList "/i `"$path`" /qn /norestart" -Wait
+          Remove-Item $path -Force
+
+      - name: 🛜 Connect to Tailscale Network
+        run: |
+          $hostname = "rdp-session-${{ github.run_id }}"
+          & "$env:ProgramFiles\Tailscale\tailscale.exe" up --authkey=${{ secrets.TAILSCALE_AUTH_KEY }} --hostname=$hostname
+          
